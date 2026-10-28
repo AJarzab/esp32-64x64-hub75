@@ -22,6 +22,26 @@ app. Open the page in any browser on your LAN and the panel follows.
 
 ---
 
+## Pinout
+
+R1  → GPIO 25
+G1  → GPIO 26
+B1  → GPIO 27
+R2  → GPIO 14
+G2  → GPIO 32   (default 12 is a strapping pin)
+B2  → GPIO 33   (default 13)
+E   → GPIO 18   (mandatory for 64×64)
+A   → GPIO 23
+B   → GPIO 19
+C   → GPIO 22   (default 5 is a strapping pin)
+D   → GPIO 17
+CLK → GPIO 16   (via 100–220 Ω series resistor)
+LAT → GPIO 4
+OE  → GPIO 13   (default 15 is a strapping pin)
+GND → GND (pins 4, 8, 12, 16 on HUB75)
+
+---
+
 ## Features
 
 - **Upload from the browser** — drag & drop images or animated GIFs. Decoding,
