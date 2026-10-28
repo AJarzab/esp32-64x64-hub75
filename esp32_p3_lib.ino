@@ -12,31 +12,30 @@
 //  - Wi-Fi AP fallback + "change Wi-Fi" form in the web UI
 //  - live stats: FPS, heap, RSSI, flash usage, uptime
 //  - upload pre-flight free-space check
-//  v3.1 text mode:
-//  - scrolling / bounce / static / blink messages
-//  - color picker, rainbow cycling, font size and speed controls
-//  - ASCII only (built-in LED font), text overrides the image playlist
 //  v3.2 P3 Pro:
 //  - tear-free double buffering + fade transitions between files
 //  - power limiter, gamma-friendly colors
-//  - built-in effects: plasma, fire, matrix rain, starfield, Life, rainbow
 //  - NTP clock (digital + analog), on/off schedule with overnight windows
 //  - playlist editor: order, per-file hold time, enable/disable
-//  - multi-file upload queue, thumbnails, rename, delete all
+//  - multi-file upload queue, rename, delete all (no thumbnails: the browser
+//    never downloads media files, the upload preview is local)
 //  - WebSocket live status, optional PIN (cookie session), captive portal
 //  - QR code on the panel at boot / on demand
 //  - config export and settings reset
-//  v3.3 reliability:
-//  - single framebuffer + 6-bit colour depth: a 64x64 double-buffered panel
-//    eats ~99 KB of internal RAM on a board without PSRAM, which fragments the
-//    heap until AsyncWebServer cannot allocate its 2.9 KB send buffer (the
-//    page returned headers but no body). One buffer keeps ~40 KB contiguous.
+//  v3.4 (this build):
+//  - text mode, ambient effects and thumbnail downloads removed; GIF playback,
+//    images, playlist, clock and schedule stay
+//  - full 8-bit colour depth (256 levels per channel)
+//  - panel rotation 0/90/180/270, saved in NVS
+//  - single framebuffer: a 64x64 double-buffered panel eats ~99 KB of internal
+//    RAM on a board without PSRAM, which fragments the heap until
+//    AsyncWebServer cannot allocate its 2.9 KB send buffer (the page returned
+//    headers but no body). One buffer keeps ~40 KB contiguous.
 //  - heap reservation released right before server.begin(), so AsyncTCP's
 //    16 KB task stack always fits; listener is retried from loop() if needed
 //  - network bring-up reordered: listener first, association/AP afterwards
-//  - HTTP admission control: the UI page is sent one client at a time and
-//    thumbnails are queued two at a time, so a browser can no longer drain
-//    the heap; 503 + Retry-After instead of letting std::bad_alloc abort
+//  - HTTP admission control: the UI page is sent one client at a time; extra
+//    page requests are dropped without allocating a response
 //  - guarded panel init (falls back to no panel)
 //  - crash-loop guard: 3 fast restarts -> safe mode (no QR, no auto-resume)
 //  - uploads that die mid-body are reaped after 20 s (LittleFS has only a few
@@ -90,9 +89,7 @@ const char* PASS = "your-password";
 #define AP_PASSWORD "ledmatrix"
 #define MIN_FREE_BYTES (64 * 1024)
 #define DEFAULT_ROTATE_SEC 30
-#define TEXT_MAX_LEN 120
-#define FW_VERSION "3.3"
-#define EFFECT_COUNT 6
+#define FW_VERSION "3.4"
 #define GIF_CANVAS_PIXELS (PANEL_W * PANEL_H)
 
 // ==================== GLOBALS ====================
@@ -134,33 +131,6 @@ String apSsid = "";
 uint32_t lastWifiRetry = 0;
 uint8_t wifiFailCount = 0;
 
-// --- text mode ---
-bool showingText = false;
-String textMessage = "";
-String textColorHex = "ffffff";
-uint16_t textColor = 0xFFFF;
-uint8_t textEffect = 0;        // 0=scroll left, 1=bounce, 2=static wrap, 3=blink
-uint8_t textSize = 2;          // font scale 1..3
-uint16_t textSpeedMs = 20;     // ms per pixel step
-bool textRainbow = false;
-int16_t textPos = 0;
-int8_t textDir = -1;
-uint32_t textNextAt = 0;
-uint32_t textBlinkAt = 0;
-uint32_t textHueAt = 0;
-uint8_t textHue = 0;
-bool textBlinkOn = true;
-int16_t textScrollWidth = 0;
-String textLines[8];
-uint8_t textLineCount = 0;
-
-// --- effects ---
-bool showingEffect = false;
-uint8_t effectKind = 0;        // 0=plasma 1=fire 2=rain 3=stars 4=life 5=rainbow
-uint8_t effectSpeed = 5;       // 1..10
-uint32_t effectNextAt = 0;
-uint32_t effectTick = 0;
-
 // --- clock ---
 bool showingClock = false;
 uint8_t clockFace = 0;         // 0=digital 1=analog
@@ -187,6 +157,7 @@ uint8_t powerLimit = 100;      // percent of max brightness
 bool fadeEnabled = true;
 uint8_t panelBrightness = 90;  // actual value currently sent to the panel
 bool displayOk = false;        // panel controller came up; false = drawing must be skipped
+uint8_t panelRotation = 0;     // 0..3 = 0/90/180/270 degrees, applied by the driver transform
 
 // --- boot diagnostics / crash-loop guard (kept in RTC RAM across reboots) ---
 RTC_NOINIT_ATTR uint32_t bootMarker;   // magic when the previous boot reached the loop
@@ -232,17 +203,11 @@ DNSServer dnsServer;
 uint32_t lastWsPush = 0;
 uint32_t wsAuth[4] = {0, 0, 0, 0};   // client ids that presented the session token
 
-// --- compositing / effect buffers ---
+// --- compositing ---
+// The GIF decoder composes each frame into this canvas (64x64, RGB565) before
+// it is pushed to the panel, so transparency and disposal methods are applied
+// once per frame instead of writing partial rows directly to the display.
 uint16_t gifCanvas[GIF_CANVAS_PIXELS];
-uint8_t fxBuf[GIF_CANVAS_PIXELS];
-uint8_t lifeA[GIF_CANVAS_PIXELS / 8];
-uint8_t lifeB[GIF_CANVAS_PIXELS / 8];
-int8_t sinTab[256];
-struct Star { int16_t x, y; uint8_t z; };
-Star stars[70];
-int16_t rainY[PANEL_W];
-uint8_t rainSpd[PANEL_W];
-uint16_t firePal[256];
 
 // --- deferred work (done from loop, not from the async handler) ---
 bool prefsDirty = false;
@@ -401,8 +366,6 @@ void stopPlayback(bool forget = false, bool clear = true) {
   PlaybackLock guard;
   if (playingGif) { gif.close(); playingGif = false; }
   if (showingJpeg) { jpeg.close(); showingJpeg = false; }
-  showingText = false;
-  showingEffect = false;
   showingClock = false;
   showingQr = false;
   currentFile = "";
@@ -582,7 +545,7 @@ uint32_t playbackElapsedMs() {
 void pausePlayback() {
   PlaybackLock guard;
   if (paused) return;
-  if (!currentFile.length() && !showingText && !showingEffect && !showingClock) return;
+  if (!currentFile.length() && !showingClock) return;
   paused = true;
   pauseStartedAt = millis();
   Serial.println("[PLAY] paused");
@@ -742,8 +705,7 @@ void savePrefsNow() {
   prefs.putUShort("rotate", rotateSeconds);
   prefs.putUChar("pwr", powerLimit);
   prefs.putBool("fade", fadeEnabled);
-  prefs.putUChar("fx", effectKind);
-  prefs.putUChar("fxSp", effectSpeed);
+  prefs.putUChar("rot", panelRotation);
   prefs.putUChar("clkF", clockFace);
   prefs.putBool("clkD", clockDate);
   prefs.putString("tz", timeZone);
@@ -755,37 +717,6 @@ void savePrefsNow() {
 
 void servicePrefs() {
   if (prefsDirty && (int32_t)(millis() - prefsSaveAt) >= 0) savePrefsNow();
-}
-
-// Concurrency slots for full-size file responses (/raw). Each one costs a
-// 2.9 KB send buffer plus the bytes in flight in lwIP (~9 KB), so only two may
-// run at once. A slot frees itself when the last chunk is handed over, when
-// the client disconnects mid-transfer, or after 20 s as a last resort. The
-// generation token keeps a late disconnect from freeing a slot that has since
-// been handed to a different transfer.
-uint32_t rawSlotAt[2] = {0, 0};
-uint16_t rawSlotGen[2] = {0, 0};
-uint16_t rawGenNext = 0;
-
-int rawSlotAcquire(uint16_t *genOut) {
-  uint32_t now = millis();
-  for (int i = 0; i < 2; i++) {
-    if (!rawSlotAt[i] || now - rawSlotAt[i] > 20000) {
-      rawSlotAt[i] = now ? now : 1;
-      rawSlotGen[i] = ++rawGenNext;
-      if (!rawSlotGen[i]) rawSlotGen[i] = ++rawGenNext;   // 0 means "free"
-      if (genOut) *genOut = rawSlotGen[i];
-      return i;
-    }
-  }
-  return -1;
-}
-
-void rawSlotRelease(int slot, uint16_t gen) {
-  if (slot < 0 || slot >= 2) return;
-  if (gen && rawSlotGen[slot] != gen) return;   // already reused by another transfer
-  rawSlotAt[slot] = 0;
-  rawSlotGen[slot] = 0;
 }
 
 // An upload whose connection dies never delivers its final chunk, so the file
@@ -868,39 +799,9 @@ void serviceWifi() {
   if (!apFallback && wifiFailCount >= 4) startApFallback();
 }
 
-// ==================== TEXT MODE ====================
+// ==================== HELPERS ====================
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
-}
-
-uint16_t hexTo565(const String &hex) {
-  if (hex.length() != 6) return 0xFFFF;
-  uint32_t v = strtoul(hex.c_str(), nullptr, 16);
-  return rgb565((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
-}
-
-uint16_t hue565(uint8_t h) {
-  uint8_t region = h / 43;
-  uint8_t rem = (uint8_t)((h - region * 43) * 6);
-  switch (region) {
-    case 0:  return rgb565(255, rem, 0);
-    case 1:  return rgb565(255 - rem, 255, 0);
-    case 2:  return rgb565(0, 255, rem);
-    case 3:  return rgb565(0, 255 - rem, 255);
-    case 4:  return rgb565(rem, 0, 255);
-    default: return rgb565(255, 0, 255 - rem);
-  }
-}
-
-uint16_t textDrawColor() {
-  return textRainbow ? hue565(textHue) : textColor;
-}
-
-// One full marquee cycle: message width + gap, at least one screen + gap.
-int16_t textPeriod() {
-  int16_t p = textScrollWidth + 12;
-  if (p < PANEL_W + 12) p = PANEL_W + 12;
-  return p;
 }
 
 String jsonEscape(const String &s) {
@@ -913,403 +814,6 @@ String jsonEscape(const String &s) {
     else if (c != '\r') out += c;
   }
   return out;
-}
-
-// Word-wrap the message into centered lines (static / blink modes).
-void buildTextLines() {
-  textLineCount = 0;
-  int16_t maxChars = PANEL_W / (6 * (int16_t)textSize);
-  int16_t maxLines = PANEL_H / (8 * (int16_t)textSize);
-  if (maxChars < 1) maxChars = 1;
-  if (maxLines < 1) maxLines = 1;
-  if (maxLines > 8) maxLines = 8;
-
-  String rest = textMessage;
-  rest.trim();
-  while (rest.length() && textLineCount < (uint8_t)maxLines) {
-    if ((int16_t)rest.length() <= maxChars) {
-      textLines[textLineCount++] = rest;
-      break;
-    }
-    int cut = -1;
-    for (int i = 0; i < maxChars && i < (int)rest.length(); i++)
-      if (rest[i] == ' ') cut = i;
-    if (cut <= 0) cut = maxChars;
-    String line = rest.substring(0, cut);
-    line.trim();
-    if (line.length()) textLines[textLineCount++] = line;
-    rest = rest.substring(cut);
-    rest.trim();
-  }
-}
-
-void prepareTextLayout() {
-  dma_display->setTextSize(textSize);
-  if (textEffect >= 2) {
-    buildTextLines();
-    textScrollWidth = 0;
-  } else {
-    int16_t x1 = 0, y1 = 0;
-    uint16_t w = 0, h = 0;
-    dma_display->getTextBounds(textMessage.c_str(), 0, 0, &x1, &y1, &w, &h);
-    textScrollWidth = (int16_t)w + 4;
-    if (textScrollWidth < 8) textScrollWidth = 8;
-    textLineCount = 0;
-  }
-}
-
-void drawTextFrame() {
-  dma_display->clearScreen();
-  if (textEffect == 3 && !textBlinkOn) { presentFrame(); return; }
-
-  dma_display->setTextSize(textSize);
-  dma_display->setTextColor(textDrawColor());
-
-  if (textEffect >= 2) {
-    int16_t lh = 8 * (int16_t)textSize;
-    int16_t total = lh * textLineCount - (int16_t)textSize;
-    int16_t y = (PANEL_H - total) / 2;
-    for (uint8_t i = 0; i < textLineCount; i++) {
-      int16_t w = (int16_t)textLines[i].length() * 6 * (int16_t)textSize;
-      int16_t x = (PANEL_W - w) / 2;
-      if (x < 0) x = 0;
-      dma_display->setCursor(x, y + i * lh);
-      dma_display->print(textLines[i]);
-    }
-  } else {
-    int16_t y = (PANEL_H - 7 * (int16_t)textSize) / 2;
-    if (textEffect == 0) {
-      // Seamless marquee: tile copies one period apart.
-      int16_t period = textPeriod();
-      int16_t start = textPos;
-      while (start > 0) start -= period;
-      for (int16_t x = start; x < PANEL_W; x += period) {
-        dma_display->setCursor(x, y);
-        dma_display->print(textMessage);
-      }
-    } else {
-      dma_display->setCursor(textPos, y);
-      dma_display->print(textMessage);
-    }
-  }
-  presentFrame();
-}
-
-void startTextMode() {
-  PlaybackLock guard;
-  if (playingGif) { gif.close(); playingGif = false; }
-  if (showingJpeg) { jpeg.close(); showingJpeg = false; }
-  showingEffect = false;
-  showingClock = false;
-  showingQr = false;
-  paused = false;
-  showingText = true;
-  textPos = PANEL_W;
-  textDir = -1;
-  textHue = 0;
-  textBlinkOn = true;
-  prepareTextLayout();
-  drawTextFrame();
-  uint32_t now = millis();
-  textNextAt = now;
-  textBlinkAt = now;
-  textHueAt = now;
-  Serial.printf("[TEXT] '%s' effect=%u size=%u speed=%ums\n",
-                textMessage.c_str(), textEffect, textSize, textSpeedMs);
-}
-
-void stopTextMode(bool resumeMedia) {
-  PlaybackLock guard;
-  if (!showingText) return;
-  showingText = false;
-  clearPanel();
-  if (resumeMedia) {
-    String target = currentFile.length() ? currentFile : prefs.getString("last", "");
-    if (target.length() && LittleFS.exists(target)) playWithFade(target);
-  }
-}
-
-void serviceText() {
-  PlaybackLock guard;
-  if (!showingText || paused) return;
-
-  uint32_t now = millis();
-  bool redraw = false;
-
-  if (textRainbow && now - textHueAt >= 40) {
-    textHueAt = now;
-    textHue += 3;
-    redraw = true;
-  }
-
-  if (textEffect == 3) {
-    if (now - textBlinkAt >= 500) {
-      textBlinkAt = now;
-      textBlinkOn = !textBlinkOn;
-      redraw = true;
-    }
-  } else if (textEffect <= 1) {
-    if ((int32_t)(now - textNextAt) >= 0) {
-      textNextAt = now + textSpeedMs;
-      if (textEffect == 0) {
-        textPos--;
-        int16_t period = textPeriod();
-        if (textPos <= -period) textPos += period;
-      } else {
-        textPos += textDir;
-        if (textPos <= -textScrollWidth) textDir = 1;
-        else if (textPos >= PANEL_W) textDir = -1;
-      }
-      redraw = true;
-    }
-  }
-
-  if (redraw) drawTextFrame();
-}
-
-// ==================== EFFECTS ====================
-const char *effectName(uint8_t k) {
-  switch (k) {
-    case 1: return "Fire";
-    case 2: return "Matrix rain";
-    case 3: return "Starfield";
-    case 4: return "Game of Life";
-    case 5: return "Rainbow";
-    default: return "Plasma";
-  }
-}
-
-void initFirePalette() {
-  for (int i = 0; i < 256; i++) {
-    uint8_t r, g, b;
-    if (i < 85)       { r = i * 3; g = 0; b = 0; }
-    else if (i < 170) { r = 255; g = (i - 85) * 3; b = 0; }
-    else              { r = 255; g = 255; b = (i - 170) * 3; }
-    firePal[i] = rgb565(r, g, b);
-  }
-}
-
-inline bool lifeGet(const uint8_t *g, int x, int y) {
-  int i = y * PANEL_W + x;
-  return g[i >> 3] & (1 << (i & 7));
-}
-inline void lifeSet(uint8_t *g, int x, int y, bool v) {
-  int i = y * PANEL_W + x;
-  if (v) g[i >> 3] |= (1 << (i & 7));
-  else   g[i >> 3] &= ~(1 << (i & 7));
-}
-
-void initLife() {
-  memset(lifeA, 0, sizeof(lifeA));
-  memset(lifeB, 0, sizeof(lifeB));
-  for (int y = 0; y < PANEL_H; y++)
-    for (int x = 0; x < PANEL_W; x++)
-      if (random(100) < 32) lifeSet(lifeA, x, y, true);
-}
-
-void stepLife() {
-  for (int y = 0; y < PANEL_H; y++) {
-    for (int x = 0; x < PANEL_W; x++) {
-      int n = 0;
-      for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-          if (!dx && !dy) continue;
-          int nx = (x + dx + PANEL_W) % PANEL_W;
-          int ny = (y + dy + PANEL_H) % PANEL_H;
-          if (lifeGet(lifeA, nx, ny)) n++;
-        }
-      }
-      bool alive = lifeGet(lifeA, x, y);
-      lifeSet(lifeB, x, y, alive ? (n == 2 || n == 3) : (n == 3));
-    }
-  }
-  memcpy(lifeA, lifeB, sizeof(lifeA));
-}
-
-void drawFire() {
-  for (int x = 0; x < PANEL_W; x++)
-    fxBuf[(PANEL_H - 1) * PANEL_W + x] =
-      (random(100) < 70) ? 255 : (uint8_t)random(120, 220);
-
-  int decay = 9 + (10 - effectSpeed) / 2;
-  for (int y = 0; y < PANEL_H - 1; y++) {
-    for (int x = 0; x < PANEL_W; x++) {
-      int below = (y + 1) * PANEL_W + x;
-      int l = (x > 0) ? fxBuf[below - 1] : fxBuf[below];
-      int r = (x < PANEL_W - 1) ? fxBuf[below + 1] : fxBuf[below];
-      int b2 = (y < PANEL_H - 2) ? fxBuf[below + PANEL_W] : fxBuf[below];
-      int v = (fxBuf[below] * 2 + l + r + b2) / 5;
-      v -= decay;
-      fxBuf[y * PANEL_W + x] = (v > 0) ? (uint8_t)v : 0;
-    }
-  }
-
-  for (int y = 0; y < PANEL_H; y++) {
-    for (int x = 0; x < PANEL_W; x++)
-      dma_display->drawPixel(x, y, firePal[fxBuf[y * PANEL_W + x]]);
-  }
-}
-
-void initRain() {
-  memset(fxBuf, 0, sizeof(fxBuf));
-  for (int x = 0; x < PANEL_W; x++) {
-    rainY[x] = -random(4, PANEL_H);
-    rainSpd[x] = random(1, 4);
-  }
-}
-
-void drawRain() {
-  for (int i = 0; i < GIF_CANVAS_PIXELS; i++)
-    if (fxBuf[i] > 16) fxBuf[i] -= 16; else fxBuf[i] = 0;
-
-  for (int x = 0; x < PANEL_W; x++) {
-    rainY[x] += rainSpd[x];
-    if (rainY[x] >= PANEL_H + 8) {
-      rainY[x] = -random(4, 24);
-      rainSpd[x] = random(1, 4);
-    }
-    int y = rainY[x];
-    if (y >= 0 && y < PANEL_H) {
-      fxBuf[y * PANEL_W + x] = 255;
-      if (y > 0) fxBuf[(y - 1) * PANEL_W + x] = 170;
-      if (y > 1) fxBuf[(y - 2) * PANEL_W + x] = 90;
-    }
-  }
-
-  for (int y = 0; y < PANEL_H; y++) {
-    for (int x = 0; x < PANEL_W; x++) {
-      uint8_t v = fxBuf[y * PANEL_W + x];
-      dma_display->drawPixel(x, y, rgb565(v / 5, v, v / 10));
-    }
-  }
-}
-
-void initStars() {
-  for (int i = 0; i < 70; i++) {
-    stars[i].x = random(PANEL_W);
-    stars[i].y = random(PANEL_H);
-    stars[i].z = random(4, 64);
-  }
-}
-
-void drawStars() {
-  dma_display->clearScreen();
-  for (int i = 0; i < 70; i++) {
-    stars[i].z -= (effectSpeed / 3) + 1;
-    if (stars[i].z < 2) {
-      stars[i].x = random(PANEL_W);
-      stars[i].y = random(PANEL_H);
-      stars[i].z = 60;
-    }
-    int z = stars[i].z;
-    int sx = 32 + ((int)stars[i].x - 32) * 40 / z;
-    int sy = 32 + ((int)stars[i].y - 32) * 40 / z;
-    if (sx < 0 || sx >= PANEL_W || sy < 0 || sy >= PANEL_H) continue;
-    uint8_t b = 255 - z * 3;
-    dma_display->drawPixel(sx, sy, rgb565(b, b, b));
-  }
-}
-
-void drawLife() {
-  uint16_t on = rgb565(0, 255, 120);
-  for (int y = 0; y < PANEL_H; y++)
-    for (int x = 0; x < PANEL_W; x++)
-      dma_display->drawPixel(x, y, lifeGet(lifeA, x, y) ? on : 0);
-}
-
-void drawPlasma() {
-  uint32_t t = effectTick * 3;
-  for (int y = 0; y < PANEL_H; y++) {
-    for (int x = 0; x < PANEL_W; x++) {
-      int v = sinTab[(x * 3 + t) & 255]
-            + sinTab[(y * 4 - t) & 255]
-            + sinTab[((x + y) * 2 + t * 2) & 255];
-      dma_display->drawPixel(x, y, hue565((uint8_t)(v + t)));
-    }
-  }
-}
-
-void drawRainbow() {
-  for (int y = 0; y < PANEL_H; y++) {
-    for (int x = 0; x < PANEL_W; x++) {
-      uint8_t h = (uint8_t)(x * 4 + effectTick * 3 + y);
-      uint8_t v = 120 + sinTab[(x * 2 + effectTick) & 255] / 2;
-      uint16_t c = hue565(h);
-      uint16_t r = ((c >> 11) & 0x1F) * v / 255;
-      uint16_t g = ((c >> 5) & 0x3F) * v / 255;
-      uint16_t b = (c & 0x1F) * v / 255;
-      dma_display->drawPixel(x, y, (r << 11) | (g << 5) | b);
-    }
-  }
-}
-
-void drawEffectFrame() {
-  switch (effectKind) {
-    case 1: drawFire(); break;
-    case 2: drawRain(); break;
-    case 3: drawStars(); break;
-    case 4: drawLife(); break;
-    case 5: drawRainbow(); break;
-    default: drawPlasma(); break;
-  }
-  presentFrame();
-}
-
-void startEffectMode() {
-  PlaybackLock guard;
-  if (playingGif) { gif.close(); playingGif = false; }
-  if (showingJpeg) { jpeg.close(); showingJpeg = false; }
-  showingText = false;
-  showingClock = false;
-  showingQr = false;
-  paused = false;
-  showingEffect = true;
-  effectTick = 0;
-  effectNextAt = millis();
-
-  if (effectKind == 1) {
-    initFirePalette();
-    memset(fxBuf, 0, sizeof(fxBuf));
-  } else if (effectKind == 2) {
-    initRain();
-  } else if (effectKind == 3) {
-    initStars();
-  } else if (effectKind == 4) {
-    initLife();
-  }
-
-  drawEffectFrame();
-  Serial.printf("[FX] %s speed=%u\n", effectName(effectKind), effectSpeed);
-}
-
-void stopEffectMode(bool resumeMedia) {
-  PlaybackLock guard;
-  if (!showingEffect) return;
-  showingEffect = false;
-  clearPanel();
-  if (resumeMedia) {
-    String target = currentFile.length() ? currentFile : prefs.getString("last", "");
-    if (target.length() && LittleFS.exists(target)) playWithFade(target);
-  }
-}
-
-void serviceEffect() {
-  PlaybackLock guard;
-  if (!showingEffect || paused) return;
-
-  uint32_t now = millis();
-  if ((int32_t)(now - effectNextAt) < 0) return;
-  effectNextAt = now + (70 - effectSpeed * 5);
-  effectTick++;
-
-  if (effectKind == 4) {
-    if (effectTick % 4 == 0) {
-      stepLife();
-      drawEffectFrame();
-    }
-  } else {
-    drawEffectFrame();
-  }
 }
 
 // ==================== CLOCK ====================
@@ -1393,8 +897,6 @@ void startClockMode() {
   PlaybackLock guard;
   if (playingGif) { gif.close(); playingGif = false; }
   if (showingJpeg) { jpeg.close(); showingJpeg = false; }
-  showingText = false;
-  showingEffect = false;
   showingQr = false;
   paused = false;
   showingClock = true;
@@ -1424,9 +926,7 @@ void serviceClock() {
 
 // ==================== SCHEDULE ====================
 void redrawCurrentMode() {
-  if (showingText) drawTextFrame();
-  else if (showingEffect) drawEffectFrame();
-  else if (showingClock) drawClockFrame();
+  if (showingClock) drawClockFrame();
   else if (playingGif) pushGifCanvas();
   else if (currentFile.length()) playFile(currentFile);
   else clearPanel();
@@ -1470,9 +970,7 @@ void checkSchedule() {
 String buildStatusJson() {
   PlaybackLock guard;
   String type = "none";
-  if (showingText) type = "text";
-  else if (showingEffect) type = "effect";
-  else if (showingClock) type = "clock";
+  if (showingClock) type = "clock";
   else if (showingQr) type = "qr";
   else if (playingGif) type = "gif";
   else if (showingJpeg) type = "jpeg";
@@ -1484,12 +982,6 @@ String buildStatusJson() {
   json.reserve(900);
   json += "\"file\":\"" + currentFile + "\",";
   json += "\"type\":\"" + type + "\",";
-  json += "\"text\":\"" + jsonEscape(textMessage) + "\",";
-  json += "\"textEffect\":" + String(textEffect) + ",";
-  json += "\"textSize\":" + String(textSize) + ",";
-  json += "\"textColor\":\"" + textColorHex + "\",";
-  json += "\"textSpeed\":" + String(textSpeedMs) + ",";
-  json += "\"textRainbow\":" + String(textRainbow ? "true" : "false") + ",";
   json += "\"brightness\":" + String(currentBrightness) + ",";
   json += "\"paused\":" + String(paused ? "true" : "false") + ",";
   json += "\"auto\":" + String(autoRotate ? "true" : "false") + ",";
@@ -1505,9 +997,7 @@ String buildStatusJson() {
   json += "\"ap\":" + String(apFallback ? "true" : "false") + ",";
   json += "\"apSsid\":\"" + apSsid + "\",";
   json += "\"apIp\":\"" + (apFallback ? WiFi.softAPIP().toString() : String("")) + "\",";
-  json += "\"effect\":" + String(effectKind) + ",";
-  json += "\"effectName\":\"" + String(effectName(effectKind)) + "\",";
-  json += "\"effectSpeed\":" + String(effectSpeed) + ",";
+  json += "\"rot\":" + String(panelRotation) + ",";
   json += "\"clockFace\":" + String(clockFace) + ",";
   json += "\"clockDate\":" + String(clockDate ? "true" : "false") + ",";
   json += "\"tz\":\"" + timeZone + "\",";
@@ -1545,11 +1035,11 @@ bool authed(AsyncWebServerRequest *r) {
 bool gate(AsyncWebServerRequest *r) {
   if (authed(r)) return false;
   // Do not build a big response when RAM is nearly gone (the header list is a
-  // throwing std::list allocation). Keep it to one tiny reply; closing the
-  // client here would destroy the request object under the running handler.
+  // throwing std::list allocation). abort() needs no memory and is the
+  // library's supported way to drop a request from a handler.
   if (ESP.getFreeHeap() < 12000 ||
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 2000) {
-    r->send(503, "text/plain", "busy");
+    r->abort();
     return true;
   }
   r->send(401, "text/plain", "PIN required");
@@ -1631,8 +1121,6 @@ void drawQrScreen(const String &url) {
   PlaybackLock guard;
   if (playingGif) { gif.close(); playingGif = false; }
   if (showingJpeg) { jpeg.close(); showingJpeg = false; }
-  showingText = false;
-  showingEffect = false;
   showingClock = false;
   paused = false;
 
@@ -1703,8 +1191,6 @@ select{font:inherit;padding:.45em .6em;border-radius:6px;background:#0f1720;colo
              border-bottom:1px solid var(--border);flex-wrap:wrap}
 #files .file:last-child{border-bottom:0}
 #files .file.off{opacity:.42}
-#files .thumb{width:38px;height:38px;flex:0 0 38px;border-radius:4px;border:1px solid var(--border);
-  background:#000;object-fit:cover;image-rendering:pixelated}
 #files .name{flex:1;min-width:5em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.9em}
 #files .size{color:var(--muted);font-size:.78em;margin-left:.3em}
 #files .playing{color:var(--accent);font-weight:500}
@@ -1806,64 +1292,6 @@ details summary{cursor:pointer;font-size:.85em;color:var(--muted);padding:.2em 0
   </div>
 </div>
 
-<h2>Text &amp; effects</h2>
-<div class="card">
-  <input type="text" id="textMsg" maxlength="120" placeholder="Type a message…"
-         autocomplete="off" style="width:100%">
-  <div class="row" style="margin-top:.5em">
-    <label for="textEffect" style="font-size:.85em;color:var(--muted)">Effect</label>
-    <select id="textEffect">
-      <option value="0">Scroll left</option>
-      <option value="1">Bounce</option>
-      <option value="2">Static (wrap)</option>
-      <option value="3">Blink</option>
-    </select>
-    <label for="textSize" style="font-size:.85em;color:var(--muted);margin-left:auto">Size</label>
-    <select id="textSize" style="width:3.6em">
-      <option value="1">1</option>
-      <option value="2" selected>2</option>
-      <option value="3">3</option>
-    </select>
-  </div>
-  <div class="row" style="margin-top:.5em">
-    <label for="textColor" style="font-size:.85em;color:var(--muted)">Color</label>
-    <input type="color" id="textColor" value="#ffffff">
-    <label class="toggle"><input type="checkbox" id="textRainbow"> Rainbow</label>
-    <label for="textSpeed" style="font-size:.85em;color:var(--muted);margin-left:auto">Speed</label>
-    <input type="range" id="textSpeed" min="5" max="120" step="5" value="20"
-           style="max-width:7em" title="Milliseconds per pixel step (lower = faster)">
-  </div>
-  <div class="row" style="margin-top:.6em">
-    <button id="textSend">Show text</button>
-    <button class="ghost" id="textStop">Stop text</button>
-  </div>
-  <div style="font-size:.78em;color:var(--muted);margin-top:.45em">
-    Plain ASCII only — the LED font has no accents/emoji. Text mode pauses the image
-    playlist; “Stop text” resumes the last image.
-  </div>
-</div>
-
-<h2>Ambient effects</h2>
-<div class="card">
-  <div class="row">
-    <select id="fxKind" style="flex:1">
-      <option value="0">Plasma</option>
-      <option value="1">Fire</option>
-      <option value="2">Matrix rain</option>
-      <option value="3">Starfield</option>
-      <option value="4">Game of Life</option>
-      <option value="5">Rainbow</option>
-    </select>
-    <button id="fxStart">▶ Play</button>
-    <button class="ghost" id="fxStop">■ Stop</button>
-  </div>
-  <div class="row" style="margin-top:.5em">
-    <label for="fxSpeed" style="font-size:.85em;color:var(--muted)">Speed</label>
-    <input type="range" id="fxSpeed" min="1" max="10" value="5">
-    <span id="fxSpeedVal" style="min-width:2.2em;text-align:right">5</span>
-  </div>
-</div>
-
 <h2>Clock</h2>
 <div class="card">
   <div class="row">
@@ -1915,6 +1343,15 @@ details summary{cursor:pointer;font-size:.85em;color:var(--muted);padding:.2em 0
     <label for="pwrLimit" style="font-size:.85em;color:var(--muted)">Power limit</label>
     <input type="range" id="pwrLimit" min="20" max="100" step="5" value="100">
     <span id="pwrVal" style="min-width:3em;text-align:right">100%</span>
+  </div>
+  <div class="row" style="margin-top:.5em">
+    <label for="rotSel" style="font-size:.85em;color:var(--muted)">Rotation</label>
+    <select id="rotSel">
+      <option value="0">0&deg;</option>
+      <option value="1">90&deg;</option>
+      <option value="2">180&deg;</option>
+      <option value="3">270&deg;</option>
+    </select>
   </div>
   <label class="toggle" style="margin-top:.45em"><input type="checkbox" id="fadeTog" checked> Fade between files</label>
   <div style="font-size:.78em;color:var(--muted);margin-top:.45em">
@@ -2005,36 +1442,7 @@ const st = $('status');
 const prog = $('prog');
 const bar = prog.querySelector('.progress-bar');
 const fileInfo = $('fileInfo');
-let textInit = false;
 let panelInit = false;
-
-// ---- thumbnail loader ------------------------------------------------
-// One request per <img> at once means the browser asks for every full-size
-// file simultaneously (up to ~120 KB each). The board only has ~70 KB free,
-// so that ran the heap dry and reset the firmware. Two at a time, with a
-// retry when the server replies 503, keeps peak memory around 18 KB.
-let thumbQueue = [], thumbActive = 0;
-const THUMB_MAX = 2;
-
-function pumpThumbs() {
-  while (thumbActive < THUMB_MAX && thumbQueue.length) {
-    const job = thumbQueue.shift();
-    thumbActive++;
-    const finish = retry => {
-      thumbActive--;
-      if (retry && job.tries < 6) {
-        job.tries++;
-        setTimeout(() => { thumbQueue.unshift(job); pumpThumbs(); }, 500);
-      } else if (retry) {
-        job.img.style.visibility = 'hidden';
-      }
-      pumpThumbs();
-    };
-    job.img.onload = () => finish(false);
-    job.img.onerror = () => { job.img.removeAttribute('src'); finish(true); };
-    job.img.src = job.src + (job.tries ? '&r=' + job.tries : '');
-  }
-}
 
 // ============ AUTH / LIVE STATUS ============
 let ws = null, wsOk = false, loginShown = false;
@@ -3329,13 +2737,7 @@ function fmtUptime(s) {
 
 function applyStatus(s) {
   const playing = s.file ? s.file.replace(/^\//, '') : '';
-  if (s.type === 'text') {
-    $('stFile').textContent = '✎ ' + (s.text || '');
-    $('stFile').title = s.text || '';
-  } else if (s.type === 'effect') {
-    $('stFile').textContent = '✨ ' + (s.effectName || 'effect');
-    $('stFile').title = '';
-  } else if (s.type === 'clock') {
+  if (s.type === 'clock') {
     $('stFile').textContent = '🕒 clock';
     $('stFile').title = '';
   } else if (s.type === 'qr') {
@@ -3349,9 +2751,7 @@ function applyStatus(s) {
   $('stFps').textContent = s.type === 'gif'
     ? (s.paused ? 'paused' : s.fps + ' fps')
     : s.type === 'jpeg' ? 'static'
-    : s.type === 'text' ? 'text'
-    : s.type === 'effect' ? (s.paused ? 'paused' : 'anim')
-    : s.type === 'clock' ? 'time' : '—';
+    : s.type === 'clock' ? 'time' : '-'
   const fsPct = s.fsTotal ? Math.round(s.fsUsed / s.fsTotal * 100) : 0;
   $('stFs').textContent = fsPct + '% of ' + fmtSize(s.fsTotal);
   $('stFs').title = fmtSize(s.fsUsed) + ' / ' + fmtSize(s.fsTotal);
@@ -3370,20 +2770,8 @@ function applyStatus(s) {
     bright.value = s.brightness;
     brightVal.textContent = s.brightness;
   }
-  if (!textInit && s.text !== undefined) {
-    textInit = true;
-    $('textMsg').value = s.text || '';
-    $('textEffect').value = String(s.textEffect ?? 0);
-    $('textSize').value = String(s.textSize ?? 2);
-    $('textColor').value = '#' + (s.textColor || 'ffffff');
-    $('textSpeed').value = s.textSpeed ?? 20;
-    $('textRainbow').checked = !!s.textRainbow;
-  }
   if (!panelInit && s.pwr !== undefined) {
     panelInit = true;
-    $('fxKind').value = String(s.effect ?? 0);
-    $('fxSpeed').value = s.effectSpeed ?? 5;
-    $('fxSpeedVal').textContent = s.effectSpeed ?? 5;
     $('clkFace').value = String(s.clockFace ?? 0);
     $('clkDate').checked = !!s.clockDate;
     syncTz(s.tz);
@@ -3393,6 +2781,7 @@ function applyStatus(s) {
     $('pwrLimit').value = s.pwr ?? 100;
     $('pwrVal').textContent = (s.pwr ?? 100) + '%';
     $('fadeTog').checked = !!s.fade;
+    $('rotSel').value = String(s.rot ?? 0);
   }
   if (s.pin !== undefined) {
     $('pinState').textContent = s.pin
@@ -3448,8 +2837,6 @@ async function refresh() {
       const on = (status.type === 'gif' || status.type === 'jpeg') &&
                  status.file === '/' + f.name;
       return `<div class="file${f.en ? '' : ' off'}" data-name="${f.name.replace(/"/g, '&quot;')}">
-        <img class="thumb" loading="lazy" decoding="async" alt=""
-             data-src="/raw?f=${encodeURIComponent(f.name)}">
         <span class="name${on ? ' playing' : ''}">${on ? '▶ ' : ''}${f.name}
           <span class="size">${fmtSize(f.size)}</span></span>
         <input class="dur" type="number" min="0" max="3600" step="5" value="${f.dur}"
@@ -3464,12 +2851,6 @@ async function refresh() {
       </div>`;
     }).join('');
 
-    // Queue the thumbnails instead of letting the browser fire them all.
-    thumbQueue = [];
-    div.querySelectorAll('img.thumb[data-src]').forEach(img => {
-      thumbQueue.push({ img, src: img.dataset.src, tries: 0 });
-    });
-    pumpThumbs();
   } catch(e) {
     setStatus('Error: ' + e.message, 'error');
   }
@@ -3583,41 +2964,7 @@ $('wifiSave').onclick = async () => {
   }
 };
 
-// ============ TEXT MODE ============
-function textQuery() {
-  return 't=' + encodeURIComponent($('textMsg').value.trim()) +
-         '&e=' + $('textEffect').value +
-         '&z=' + $('textSize').value +
-         '&c=' + $('textColor').value.replace('#', '') +
-         '&sp=' + $('textSpeed').value +
-         '&r=' + ($('textRainbow').checked ? 1 : 0);
-}
-
-$('textSend').onclick = async () => {
-  const msg = $('textMsg').value.trim();
-  if (!msg) { setStatus('Type a message first.', 'error'); return; }
-  setStatus('Showing text…');
-  try {
-    const r = await fetch('/text?' + textQuery());
-    if (!r.ok) throw new Error(await r.text());
-    setStatus('✎ Text mode: ' + msg, 'ok');
-    refresh();
-  } catch(e) {
-    setStatus('Error: ' + e.message, 'error');
-  }
-};
-
-$('textStop').onclick = async () => {
-  await fetch('/text?off=1');
-  setStatus('Text stopped.');
-  refresh();
-};
-
-$('textMsg').addEventListener('keydown', e => {
-  if (e.key === 'Enter') { e.preventDefault(); $('textSend').click(); }
-});
-
-// ============ EFFECTS / CLOCK / SCHEDULE / PANEL ============
+// ============ CLOCK / SCHEDULE / PANEL ============
 async function api(q, msg) {
   try {
     const r = await fetch(q);
@@ -3629,13 +2976,6 @@ async function api(q, msg) {
   }
 }
 
-const fxSpeed = $('fxSpeed'), fxSpeedVal = $('fxSpeedVal');
-fxSpeed.oninput = () => fxSpeedVal.textContent = fxSpeed.value;
-
-$('fxStart').onclick = () => api(
-  '/effect?kind=' + $('fxKind').value + '&sp=' + $('fxSpeed').value,
-  '✨ ' + $('fxKind').options[$('fxKind').selectedIndex].text);
-$('fxStop').onclick = () => api('/effect?off=1', 'Effect stopped.');
 
 $('clkStart').onclick = () => api(
   '/clock?face=' + $('clkFace').value +
@@ -3664,6 +3004,8 @@ pwrLimit.oninput = () => {
 };
 $('fadeTog').onchange = () => api('/panel?fade=' + ($('fadeTog').checked ? 1 : 0),
   $('fadeTog').checked ? 'Fades on.' : 'Fades off.');
+$('rotSel').onchange = () => api('/panel?rot=' + $('rotSel').value,
+  'Rotation ' + ($('rotSel').value * 90) + ' degrees');
 
 $('qrBtn').onclick = async () => {
   const r = await fetch('/qr');
@@ -3823,8 +3165,6 @@ void restartNow() {
 }
 
 const char *currentModeName() {
-  if (showingText) return "text";
-  if (showingEffect) return "effect";
   if (showingClock) return "clock";
   if (showingQr) return "qr";
   if (playingGif) return "gif";
@@ -3910,9 +3250,10 @@ void setup() {
   // AsyncWebServer's 2.9 KB send buffer (the page then sends headers but no
   // body and the browser hangs). One buffer still plays GIF/video fine.
   mxconfig.double_buff = false;
-  // 6 bits per channel instead of 8: the DMA framebuffer shrinks by 25%
-  // (~16 KB here). There is no PSRAM on this board and every kilobyte counts.
-  mxconfig.setPixelColorDepthBits(6);
+  // Full 8-bit colour depth: 256 levels per channel, no visible banding on
+  // gradients. It costs ~13 KB more framebuffer RAM than 6-bit; text mode and
+  // the ambient effects were removed to pay for it.
+  mxconfig.setPixelColorDepthBits(8);
 
   // ---- restored settings (NVS) ----
   playLock = xSemaphoreCreateRecursiveMutex();
@@ -3931,11 +3272,8 @@ void setup() {
   if (powerLimit < 20) powerLimit = 20;
   if (powerLimit > 100) powerLimit = 100;
   fadeEnabled = prefs.getBool("fade", true);
-  effectKind = prefs.getUChar("fx", 0);
-  if (effectKind >= EFFECT_COUNT) effectKind = 0;
-  effectSpeed = prefs.getUChar("fxSp", 5);
-  if (effectSpeed < 1) effectSpeed = 1;
-  if (effectSpeed > 10) effectSpeed = 10;
+  panelRotation = prefs.getUChar("rot", 0);
+  if (panelRotation > 3) panelRotation = 0;
   clockFace = prefs.getUChar("clkF", 0);
   if (clockFace > 1) clockFace = 0;
   clockDate = prefs.getBool("clkD", true);
@@ -3947,18 +3285,6 @@ void setup() {
   if (adminPin.length() > 16) adminPin = adminPin.substring(0, 16);
   scanQrAtBoot = prefs.getBool("qr", true);
 
-  textMessage = prefs.getString("txt", "");
-  textEffect = prefs.getUChar("txtE", 0);
-  if (textEffect > 3) textEffect = 0;
-  textSize = prefs.getUChar("txtZ", 2);
-  if (textSize < 1 || textSize > 3) textSize = 2;
-  textSpeedMs = prefs.getUShort("txtSp", 20);
-  if (textSpeedMs < 5) textSpeedMs = 5;
-  if (textSpeedMs > 120) textSpeedMs = 120;
-  textRainbow = prefs.getBool("txtR", false);
-  textColorHex = prefs.getString("txtC", "ffffff");
-  if (textColorHex.length() != 6) textColorHex = "ffffff";
-  textColor = hexTo565(textColorHex);
 
   setBootStage(10);
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
@@ -3974,8 +3300,12 @@ void setup() {
   if (!displayOk) {
     Serial.println("[DISP] panel unavailable - continuing so the web UI still starts");
   } else {
-    Serial.printf("[DISP] panel ok, double_buff=%d\n",
-                  dma_display->getCfg().double_buff ? 1 : 0);
+    Serial.printf("[DISP] panel ok, double_buff=%d depth=8 rot=%u\n",
+                  dma_display->getCfg().double_buff ? 1 : 0,
+                  (unsigned)panelRotation);
+    // Rotation is applied inside the driver's drawPixel/fillRect transform, so
+    // it has to be set before the first frame is drawn.
+    dma_display->setRotation(panelRotation);
     presentFrame();              // align double-buffer index after begin()
     applyBrightness();
     dma_display->clearScreen();
@@ -3984,9 +3314,6 @@ void setup() {
   char tok[20];
   snprintf(tok, sizeof(tok), "%08x%08x", (unsigned)esp_random(), (unsigned)esp_random());
   authToken = tok;
-
-  for (int i = 0; i < 256; i++)
-    sinTab[i] = (int8_t)(sinf(i * 2.0f * PI / 256.0f) * 127.0f);
 
   setBootStage(20);
   // No full-screen colour flashes: they spike current on a marginal 5 V supply
@@ -4013,9 +3340,9 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (ESP.getFreeHeap() < 16000 || largest < 3000) {
-      // Never close the client from inside a handler: the library deletes the
-      // request object on disconnect and would return into freed memory.
-      r->send(503, "text/plain", "busy");
+      // Never close the client from inside a handler (the request would be
+      // destroyed under us); abort() is the library's own way to drop one.
+      r->abort();
       return;
     }
     uint32_t nowMs = millis();
@@ -4182,45 +3509,6 @@ void setup() {
     r->send(200, "text/plain", "OK");
   });
 
-  server.on("/raw", HTTP_GET, [](AsyncWebServerRequest *r) {
-    if (gate(r)) return;
-    if (!r->hasParam("f")) { r->send(400); return; }
-    // Thumbnails are the full-size images (up to ~120 KB). A browser fires one
-    // request per <img> at once, so only two may stream at a time; the rest get
-    // a 503 that the UI retries (never close() - see the "/" handler).
-    uint16_t gen = 0;
-    int slot = rawSlotAcquire(&gen);
-    if (slot < 0) {
-      AsyncWebServerResponse *busy = r->beginResponse(503, "text/plain", "busy");
-      busy->addHeader("Retry-After", "1");
-      r->send(busy);
-      return;
-    }
-    String p = "/" + stripSlash(r->getParam("f")->value());
-    if (!LittleFS.exists(p)) { rawSlotRelease(slot, gen); r->send(404); return; }
-    String lower = p; lower.toLowerCase();
-    const char *ct = lower.endsWith(".jpg") || lower.endsWith(".jpeg") ? "image/jpeg" : "image/gif";
-    File f = LittleFS.open(p, "r");
-    if (!f) { rawSlotRelease(slot, gen); r->send(404); return; }
-    // A response with a known Content-Length stops calling this filler as soon
-    // as the last byte is buffered - it is never called again with 0 - so the
-    // slot has to be released when index + n reaches the file size. Tests
-    // confirm it: releasing only on read()==0 leaked both slots and every
-    // later thumbnail got a 503 until the 20 s expiry.
-    size_t fsize = f.size();
-    AsyncWebServerResponse *res = r->beginResponse(ct, fsize,
-      [f, slot, gen, fsize](uint8_t *buf, size_t maxLen, size_t index) mutable -> size_t {
-        size_t n = f.read(buf, maxLen);
-        if (!n || index + n >= fsize) { if (f) f.close(); rawSlotRelease(slot, gen); }
-        return n;
-      });
-    // Browser cancelled the image (tab closed / scrolled away): give the slot
-    // back at once instead of waiting for the 20 s expiry.
-    r->onDisconnect([slot, gen]() { rawSlotRelease(slot, gen); });
-    res->addHeader("Cache-Control", "max-age=600");
-    r->send(res);
-  });
-
   server.on("/rename", HTTP_GET, [](AsyncWebServerRequest *r) {
     if (gate(r)) return;
     if (!r->hasParam("f") || !r->hasParam("to")) { r->send(400, "text/plain", "Missing name"); return; }
@@ -4262,15 +3550,13 @@ void setup() {
     j += ",\"rotate\":" + String(rotateSeconds);
     j += ",\"pwr\":" + String(powerLimit);
     j += ",\"fade\":" + String(fadeEnabled ? "true" : "false");
-    j += ",\"effect\":" + String(effectKind);
-    j += ",\"effectSpeed\":" + String(effectSpeed);
+    j += ",\"rot\":" + String(panelRotation);
     j += ",\"clockFace\":" + String(clockFace);
     j += ",\"clockDate\":" + String(clockDate ? "true" : "false");
     j += ",\"tz\":\"" + timeZone + "\"";
     j += ",\"sched\":" + String(schedEnabled ? "true" : "false");
     j += ",\"schedOn\":" + String(schedOnMin);
     j += ",\"schedOff\":" + String(schedOffMin);
-    j += ",\"text\":\"" + jsonEscape(textMessage) + "\"";
     j += "}";
     AsyncWebServerResponse *res = r->beginResponse(200, "application/json", j);
     res->addHeader("Content-Disposition", "attachment; filename=\"ledmatrix-config.json\"");
@@ -4375,7 +3661,7 @@ void setup() {
           playStartedAt = millis();
           pausedAccumMs = 0;
         }
-        if (!currentFile.length() && !showingText) playRelative(1);
+        if (!currentFile.length()) playRelative(1);
       }
       markPrefsDirty();
     } else if (a == "shuffle") {
@@ -4415,90 +3701,6 @@ void setup() {
       markPrefsDirty();
     }
     r->send(200);
-  });
-
-  server.on("/text", HTTP_GET, [](AsyncWebServerRequest *r) {
-    if (gate(r)) return;
-    PlaybackLock guard;
-    if (r->hasParam("off")) {
-      stopTextMode(true);
-      r->send(200, "text/plain", "OK");
-      return;
-    }
-
-    String raw = r->hasParam("t") ? r->getParam("t")->value() : textMessage;
-    String clean;
-    clean.reserve(raw.length());
-    for (size_t i = 0; i < raw.length() && clean.length() < TEXT_MAX_LEN; i++) {
-      char c = raw[i];
-      if (c >= 32 && c <= 126) clean += c;
-    }
-    clean.trim();
-    if (!clean.length()) { r->send(400, "text/plain", "Empty text"); return; }
-
-    textMessage = clean;
-
-    if (r->hasParam("e")) {
-      int e = r->getParam("e")->value().toInt();
-      if (e < 0) e = 0;
-      if (e > 3) e = 3;
-      textEffect = (uint8_t)e;
-    }
-    if (r->hasParam("z")) {
-      int z = r->getParam("z")->value().toInt();
-      if (z < 1) z = 1;
-      if (z > 3) z = 3;
-      textSize = (uint8_t)z;
-    }
-    if (r->hasParam("sp")) {
-      int sp = r->getParam("sp")->value().toInt();
-      if (sp < 5) sp = 5;
-      if (sp > 120) sp = 120;
-      textSpeedMs = (uint16_t)sp;
-    }
-    if (r->hasParam("r")) {
-      textRainbow = (r->getParam("r")->value() != "0");
-    }
-    if (r->hasParam("c")) {
-      String c = r->getParam("c")->value();
-      if (c.startsWith("#")) c = c.substring(1);
-      if (c.length() == 6) textColorHex = c;
-    }
-    textColor = hexTo565(textColorHex);
-
-    prefs.putString("txt", textMessage);
-    prefs.putUChar("txtE", textEffect);
-    prefs.putUChar("txtZ", textSize);
-    prefs.putUShort("txtSp", textSpeedMs);
-    prefs.putBool("txtR", textRainbow);
-    prefs.putString("txtC", textColorHex);
-
-    startTextMode();
-    r->send(200, "text/plain", "OK");
-  });
-
-  server.on("/effect", HTTP_GET, [](AsyncWebServerRequest *r) {
-    if (gate(r)) return;
-    PlaybackLock guard;
-    if (r->hasParam("off")) {
-      stopEffectMode(true);
-      r->send(200, "text/plain", "OK");
-      return;
-    }
-    if (r->hasParam("kind")) {
-      int k = r->getParam("kind")->value().toInt();
-      if (k < 0) k = 0;
-      if (k >= EFFECT_COUNT) k = EFFECT_COUNT - 1;
-      effectKind = (uint8_t)k;
-      markPrefsDirty();
-    }
-    if (r->hasParam("sp")) {
-      int s = r->getParam("sp")->value().toInt();
-      effectSpeed = (uint8_t)constrain(s, 1, 10);
-      markPrefsDirty();
-    }
-    startEffectMode();
-    r->send(200, "text/plain", effectName(effectKind));
   });
 
   server.on("/clock", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -4564,6 +3766,16 @@ void setup() {
     if (r->hasParam("fade")) {
       fadeEnabled = (r->getParam("fade")->value() != "0");
       markPrefsDirty();
+    }
+    if (r->hasParam("rot")) {
+      uint8_t rot = (uint8_t)constrain(r->getParam("rot")->value().toInt(), 0, 3);
+      if (rot != panelRotation) {
+        panelRotation = rot;
+        if (displayOk) dma_display->setRotation(panelRotation);
+        redrawCurrentMode();
+        applyBrightness();
+        markPrefsDirty();
+      }
     }
     if (r->hasParam("qr")) {
       scanQrAtBoot = (r->getParam("qr")->value() != "0");
@@ -4787,17 +3999,13 @@ void loop() {
     return;
   }
 
-  // Text / effect / clock own the panel while active; otherwise auto-rotate the playlist.
+  // The clock owns the panel while shown; otherwise auto-rotate the playlist.
   if (showingQr) {
     if (qrUntil && (int32_t)(now - qrUntil) >= 0) {
       showingQr = false;
       qrUntil = 0;
       redrawCurrentMode();
     }
-  } else if (showingText) {
-    serviceText();
-  } else if (showingEffect) {
-    serviceEffect();
   } else if (showingClock) {
     serviceClock();
   } else if (autoRotate && !paused && currentFile.length()) {
@@ -4809,8 +4017,8 @@ void loop() {
     }
   }
 
-  if (playingGif && !paused && !showingText && !showingEffect && !showingClock
-      && !showingQr && millis() >= nextFrameTime) {
+  if (playingGif && !paused && !showingClock && !showingQr &&
+      millis() >= nextFrameTime) {
     PlaybackLock guard;
     int frameDelay = 0;
     if (!gif.playFrame(false, &frameDelay)) {

@@ -2,12 +2,12 @@
 
 A self-contained web player for a 64×64 P3 HUB75 LED panel driven by a plain
 **ESP32-WROOM-32 (4 MB flash, no PSRAM)**. The ESP32 hosts the whole app: the
-web UI, the upload/conversion pipeline, the playlist, text mode, effects, an
-NTP clock and a scheduler. Nothing else is needed — no PC, no cloud, no phone
-app. Open the page in any browser on your LAN and the panel follows.
+web UI, the GIF/image pipeline, the playlist, an NTP clock and a scheduler.
+Nothing else is needed — no PC, no cloud, no phone app. Open the page in any
+browser on your LAN and the panel follows.
 
 > Tested on an ESP32-WROOM-32 DevKit with a 64×64 P3 panel, Arduino-ESP32
-> 3.3.12. Firmware size is ~1.29 MB (98% of the stock 1.31 MB app partition),
+> 3.3.12. Firmware size is ~1.27 MB (96% of the stock 1.31 MB app partition),
 > so the stock partition table must be kept.
 
 ## Quick start
@@ -24,49 +24,34 @@ app. Open the page in any browser on your LAN and the panel follows.
 
 ## Pinout
 
+```
 R1  → GPIO 25
-
 G1  → GPIO 26
-
 B1  → GPIO 27
-
 R2  → GPIO 14
-
 G2  → GPIO 32   (default 12 is a strapping pin)
-
 B2  → GPIO 33   (default 13)
-
 E   → GPIO 18   (mandatory for 64×64)
-
 A   → GPIO 23
-
 B   → GPIO 19
-
 C   → GPIO 22   (default 5 is a strapping pin)
-
 D   → GPIO 17
-
 CLK → GPIO 16   (via 100–220 Ω series resistor)
-
 LAT → GPIO 4
-
 OE  → GPIO 13   (default 15 is a strapping pin)
-
 GND → GND (pins 4, 8, 12, 16 on HUB75)
+```
 
 ---
 
 ## Features
 
-- **Upload from the browser** — drag & drop images or animated GIFs. Decoding,
-  cropping, scaling to 64×64 and re-encoding all happen in the browser; the
-  ESP32 only stores and plays the result.
+- **Upload from the browser** — drag & drop animated GIFs, JPEG, PNG, WebP or
+  BMP files. Decoding, cropping, scaling to 64×64 and re-encoding all happen in
+  the browser; the ESP32 only stores and plays the result.
+- **Animated GIF playback** — loops indefinitely, pause/resume, next/previous.
 - **Playlist** — reorder, per-file hold time, enable/disable, auto-rotate and
   shuffle. Settings and the last played file survive a reboot (NVS).
-- **Text mode** — scrolling, bouncing, static and blinking messages, colour
-  picker, rainbow cycling, font size and speed.
-- **Six built-in effects** — plasma, fire, matrix rain, starfield, Game of Life,
-  rainbow.
 - **Clock** — digital and analog faces, date, NTP sync, configurable timezone.
 - **On/off schedule** — daily window (overnight windows such as 18:00 → 02:00
   are supported).
@@ -74,12 +59,18 @@ GND → GND (pins 4, 8, 12, 16 on HUB75)
   file once per second.
 - **Brightness and power limit** — dim the panel or cap current draw if your
   supply is marginal.
+- **Panel rotation** — 0°, 90°, 180° or 270°, saved in NVS.
+- **8-bit colour** — 256 levels per channel, no banding on gradients.
 - **PIN protection** — optional 4–16 character PIN, cookie session.
 - **Wi-Fi setup without reflashing** — change SSID/password from the UI; falls
   back to a captive-portal AP if the network is unavailable.
 - **mDNS** — reachable at `http://ledmatrix.local` as well as by IP.
 - **Diagnostics** — `/diag` reports heap, reset reason and boot stage, which is
   what you need when something goes wrong.
+
+The page never downloads the stored media. The file list shows names and sizes,
+and the live 64×64 preview is rendered locally in the browser from the file you
+are about to upload — that is what keeps a 4 MB, PSRAM-less board responsive.
 
 ---
 
@@ -97,22 +88,24 @@ GND → GND (pins 4, 8, 12, 16 on HUB75)
 The pins below are what the sketch uses (`CONFIGURATION` block at the top of
 `esp32_p3_lib.ino`). Change them there if your board is wired differently.
 
-HUB75 pin	Signal → ESP32 GPIO	Notes
-R1  → GPIO 25
-G1  → GPIO 26
-B1  → GPIO 27
-R2  → GPIO 14
-G2  → GPIO 32   (default 12 is a strapping pin)
-B2  → GPIO 33   (default 13)
-E   → GPIO 18   (mandatory for 64×64)
-A   → GPIO 23
-B   → GPIO 19
-C   → GPIO 22   (default 5 is a strapping pin)
-D   → GPIO 17
-CLK → GPIO 16   (via 100–220 Ω series resistor)
-LAT → GPIO 4
-OE  → GPIO 13   (default 15 is a strapping pin)
-GND → GND (pins 4, 8, 12, 16 on HUB75)
+| HUB75 pin | ESP32 GPIO | Notes |
+| --- | --- | --- |
+| R1 | 25 | |
+| G1 | 26 | |
+| B1 | 27 | |
+| R2 | 14 | |
+| G2 | 32 | default 12 is a strapping pin |
+| B2 | 33 | default 13 |
+| A | 23 | |
+| B | 19 | |
+| C | 22 | default 5 is a strapping pin |
+| D | 17 | |
+| E | 18 | mandatory for 64×64 |
+| CLK | 16 | via a 100–220 Ω series resistor |
+| LAT | 4 | |
+| OE | 13 | default 15 is a strapping pin |
+| GND | GND | pins 4, 8, 12, 16 on the HUB75 connector |
+
 ### Power
 
 - **Do not power the panel from the ESP32's 5 V pin.** Feed the panel from the
@@ -153,7 +146,7 @@ ESP32 core.
 | CPU frequency | 240 MHz |
 | Upload speed | 921600 (drop to 115200 if uploads fail) |
 
-The app uses about **1.29 MB of the 1.31 MB** application partition. Do not
+The app uses about **1.27 MB of the 1.31 MB** application partition. Do not
 switch to a partition scheme with a smaller app slot — the build will not fit.
 
 ---
@@ -186,7 +179,10 @@ switch to a partition scheme with a smaller app slot — the build will not fit.
 
 If the upload stops with `Wrong boot mode detected (0x13)`, the board's
 auto-reset circuit did not pull GPIO0 low. Hold **BOOT**, tap **EN**, release
-**BOOT**, then upload again. See [Troubleshooting](#troubleshooting).
+**BOOT**, then upload again. If that still fails (some clone boards have no
+working auto-reset at all), connect **IO0 to GND** with a jumper, tap **EN**,
+and keep the jumper in place until the upload finishes. See
+[Troubleshooting](#troubleshooting).
 
 ---
 
@@ -226,24 +222,23 @@ The page is one file served from flash; it works on desktop and mobile.
   `<original>_64.gif` (static images may be sent as JPEG). Files larger than
   1 MB are refused, and uploads that would leave the filesystem nearly full
   are rejected before they start.
+- **Live preview** — the 64×64 preview shows exactly what will be stored,
+  including animation and the crop, before you upload.
 - **Preview & transport** — play/pause, next/previous, auto-rotate, shuffle,
-  and a live view of the current frame with its delay.
+  and the current file with its delay.
 - **Playlist** — every stored file with its hold time and an enable toggle;
-  drag order with the up/down arrows.
-- **Text** — type a message, pick an effect (scroll, bounce, static, blink),
-  colour, size and speed.
-- **Effects** — choose one of six effects and its speed.
+  move entries with the up/down arrows.
 - **Clock** — digital/analog, show date, timezone (POSIX TZ string), and the
   daily on/off window.
-- **Panel & color** — power limit and fade-between-files.
+- **Panel & color** — power limit, rotation (0/90/180/270) and
+  fade-between-files.
 - **Brightness** — 1–255 slider; the value is persisted.
-- **Files** — thumbnails, rename, delete, delete all, free-space display.
+- **Files** — name, size, rename, delete, delete all, free-space display.
 - **Tools** — PIN, Wi-Fi change, config export, diagnostics, firmware version.
 
-Images are shown as thumbnails at full resolution. When a page is opened, the
-browser requests each thumbnail; the firmware serves at most **two** at a time
-and drops the rest (the UI retries them). Seeing a thumbnail appear a moment
-late is normal on a board without PSRAM and is not an error.
+The file list deliberately has no thumbnails: streaming full-size images to the
+browser was the main source of heap exhaustion on a board without PSRAM. The
+playlist and preview give you the same information without transferring media.
 
 ---
 
@@ -254,13 +249,12 @@ This build targets the hardest configuration: 4 MB flash and **no PSRAM**.
 - **Single framebuffer.** A second 64×64 framebuffer costs ~40 KB of internal
   RAM and fragments the heap until the web server can no longer allocate its
   send buffer. `double_buff = false` is therefore deliberate.
-- **6-bit colour depth** instead of 8 — the DMA buffer is 25% smaller (~16 KB
-  saved). Colours are slightly less smooth; this is the trade for a stable
-  server.
-- **One page download at a time**, two full-size image responses at a time.
-  Everything else is dropped at the connection level instead of allocating a
-  response it does not have memory for. This is what keeps a browser from
-  crashing the chip.
+- **8-bit colour depth.** Text mode and the ambient effect generators were
+  removed so the framebuffer could grow from 6-bit to full 8-bit (256 levels
+  per channel, ~13 KB more RAM than 6-bit).
+- **No media bytes over HTTP.** The UI never downloads stored images; the page
+  is one download at a time. Extra page requests are dropped at the connection
+  level instead of allocating a response the board does not have memory for.
 - **Uploads are reaped.** A connection that dies mid-upload leaves a half
   file; it is closed and removed after 20 s, and playback refuses to open a
   file that is still being written (LittleFS has very few file descriptors).
@@ -268,10 +262,12 @@ This build targets the hardest configuration: 4 MB flash and **no PSRAM**.
   considered wedged and the board reboots into a clean state.
 - **Crash-loop guard.** Three fast restarts put the board into safe mode: no
   boot QR, no auto-resume, web UI always up.
-- **Flash budget.** The UI is 70 KB of HTML/CSS/JS stored in program memory and
-  streamed out, never copied to RAM. Adding large assets will not fit.
+- **Flash budget.** The UI is ~64 KB of HTML/CSS/JS stored in program memory
+  and streamed out, never copied to RAM. Adding large assets will not fit.
 
-Typical idle memory: **~75–85 KB free heap** with ~30–40 KB largest block.
+Typical idle memory with 8-bit colour: **~75–80 KB free heap** with a
+~35–40 KB largest block. The largest free block, not the total, is what limits
+the web server.
 
 ### Panel behaviour worth knowing
 
@@ -279,7 +275,8 @@ Typical idle memory: **~75–85 KB free heap** with ~30–40 KB largest block.
   (100 KB+) may play slower than their nominal frame delay.
 - Fades are done by ramping panel brightness; with a single framebuffer there
   is no cross-fade between two images.
-- Text and effects override the playlist until you stop them.
+- The clock overrides the playlist until you stop it.
+- Rotation applies to everything drawn on the panel (images, clock, QR code).
 
 ---
 
@@ -294,16 +291,13 @@ All endpoints are `GET` and return `text/plain` or JSON, except `/upload`
 | `/` | – | Web UI (HTML) |
 | `/upload` | multipart `file` | Store a 64×64 image/GIF (max 1 MB) |
 | `/files-json` | – | List files with size and playlist metadata |
-| `/raw` | `f` | Full-size image bytes (`image/gif` or `image/jpeg`) |
 | `/play` | `f` | Play a stored file |
 | `/stop` | – | Stop playback |
 | `/ctl` | `a`=toggle\|pause\|resume\|next\|prev\|auto\|shuffle\|interval, `v`=0\|1 or seconds | Transport, rotation, interval |
-| `/text` | `t`, `e` (0–3), `z` (1–3), `c` (RRGGBB), `r`=1, `sp` (5–120); `off=1` | Text mode |
-| `/effect` | `kind`=0–5, `sp`=1–10; `off=1` | Effects |
 | `/clock` | `face`=0\|1, `date`=0\|1, `tz`=POSIX TZ; `off=1` | Clock |
 | `/schedule` | `on`=0\|1, `from`=HH:MM, `to`=HH:MM | Daily on/off window |
 | `/bright` | `v`=1–255 | Brightness |
-| `/panel` | `pwr`=20–100, `fade`=0\|1 | Power limit, fades |
+| `/panel` | `pwr`=20–100, `fade`=0\|1, `rot`=0–3, `qr`=0\|1 | Power limit, fades, rotation, boot QR |
 | `/pl` | `f`, plus `up` \| `down` \| `en`=0\|1 \| `dur`=seconds | Playlist edit |
 | `/del` | `f` | Delete one file |
 | `/delall` | – | Delete all files |
@@ -323,8 +317,7 @@ Examples:
 
 ```bash
 curl "http://192.168.0.50/play?f=logo_64.gif"
-curl "http://192.168.0.50/text?t=Hello&e=0&c=00ff80&z=2"
-curl "http://192.168.0.50/effect?kind=1&sp=6"
+curl "http://192.168.0.50/panel?rot=1"
 curl "http://192.168.0.50/bright?v=120"
 curl "http://192.168.0.50/diag"
 curl -F "file=@logo_64.gif" "http://192.168.0.50/upload"
@@ -336,12 +329,12 @@ curl -F "file=@logo_64.gif" "http://192.168.0.50/upload"
 
 | Symptom | Cause / fix |
 | --- | --- |
-| Upload fails: `Wrong boot mode detected (0x13)` | Auto-reset did not enter download mode. Hold **BOOT**, tap **EN**, release **BOOT**, upload again. |
+| Upload fails: `Wrong boot mode detected (0x13)` | Auto-reset did not enter download mode. Hold **BOOT**, tap **EN**, release **BOOT**, upload again. If it persists, jumper **IO0–GND**, tap **EN** and keep the jumper until flashing ends. |
 | Upload dies part-way, board then logs `invalid segment length` / `No bootable app partitions` | The application partition was overwritten partially. Reflash — the bootloader is fine. |
-| Page loads but thumbnails appear late or stay hidden | Normal under load: only two `/raw` transfers run at once and the rest are dropped so the UI retries them. Reload the page if one stays empty. |
 | `503 Busy, retrying…` when opening several tabs | Admission control. One page transfer at a time is deliberate. |
 | `ledmatrix.local` does not resolve | mDNS is not always available on Windows. Use the IP shown in the serial log. |
 | Panel stays black | Check the E pin and the 1/32 scan type, the 5 V supply and ground, and brightness (try `/bright?v=128`). If the board restarted three times quickly it is in safe mode — power-cycle once. |
+| Image is sideways | Set **Panel & color → Rotation** to 0/90/180/270. Rotation is stored in NVS. |
 | Random reboots on bright content | Power supply too weak. Lower **Power limit**, use a 4 A supply, shorten the power leads. |
 | FPS drops with many files | GIF decoding is CPU-bound; smaller/shorter GIFs and fewer files help. |
 | Settings keep reverting | `/reset` erases NVS. Otherwise settings persist automatically a few seconds after a change. |
@@ -371,11 +364,14 @@ esp32_p3_lib/
 ├── esp32_p3_lib.ino   firmware + embedded web UI (HTML/CSS/JS in PROGMEM)
 ├── qr_local.c         QR encoder used for the boot screen
 ├── qr_local.h
+├── LICENSE
 └── README.md
 ```
 
 `build/` holds generated binaries and is ignored by `.gitignore`; never commit
-it (the merged image alone is 4 MB).
+it (the merged image alone is 4 MB). The old `build/` binaries were removed
+from the repository in v3.4 — build from source instead of flashing stale
+images.
 
 ---
 
@@ -388,14 +384,14 @@ Issues and pull requests are welcome. Please include:
 - the output of `/diag` while the problem is visible.
 
 For memory-related changes, keep an eye on `heap` and `heapLargest` in
-`/diag` after a page load and a few thumbnail requests: the largest free block
-is what limits the server, not the total heap.
+`/diag` after a page load and a few GIF frames: the largest free block is what
+limits the server, not the total heap.
 
 ---
 
 ## License
 
-GNU 3.0
+GNU General Public License v3.0 — see [`LICENSE`](LICENSE).
 
 ## Credits
 
