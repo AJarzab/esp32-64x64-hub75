@@ -1,0 +1,12 @@
+# Arduino / build output
+build/
+*.bin
+*.elf
+*.map
+*.bak
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
