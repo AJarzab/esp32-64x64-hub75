@@ -325,6 +325,25 @@ curl -F "file=@logo_64.gif" "http://192.168.0.50/upload"
 
 ---
 
+## Home Assistant (optional)
+
+No firmware change is needed: Home Assistant can drive the panel over the same
+HTTP API. A ready-made package lives in [`homeassistant/`](homeassistant/):
+
+- `homeassistant/led_matrix.yaml` — REST sensor, commands, scripts and
+  `switch`/`number`/`select` entities (clock, playlist, brightness, power
+  limit, rotation, schedule)
+- `homeassistant/dashboard.yaml` — a phone-sized Lovelace view
+- `homeassistant/README.md` — install steps, Android widgets/Assist notes and
+  example automations
+
+Copy the package to `/config/packages/led_matrix.yaml`, set the board's IP in
+the *LED matrix host* helper, and restart. If a PIN is set, put it in the
+*LED matrix PIN* helper — the API accepts `?pin=…` on every endpoint, so no
+cookie handling is required.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -364,6 +383,7 @@ esp32_p3_lib/
 ├── esp32_p3_lib.ino   firmware + embedded web UI (HTML/CSS/JS in PROGMEM)
 ├── qr_local.c         QR encoder used for the boot screen
 ├── qr_local.h
+├── homeassistant/     optional Home Assistant package + dashboard
 ├── LICENSE
 └── README.md
 ```

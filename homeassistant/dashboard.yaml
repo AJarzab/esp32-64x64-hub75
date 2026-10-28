@@ -1,0 +1,80 @@
+# Lovelace view for the ESP32 LED matrix.
+#
+# Easiest way to use it: open the dashboard, Edit -> raw configuration
+# editor, and paste everything below (or add it under `views:` of an
+# existing dashboard). It uses built-in cards only, no HACS.
+#
+# If the board is not at 192.168.0.113, change the URL in the last card.
+
+title: LED Matrix
+views:
+  - title: Matrix
+    path: matrix
+    icon: mdi:led-strip-variant
+    cards:
+      - type: markdown
+        content: |
+          {% set st = state_attr('sensor.led_matrix', 'type') or 'idle' %}
+          {% set file = state_attr('sensor.led_matrix', 'file') or '-' %}
+          {% set fps = state_attr('sensor.led_matrix', 'fps') | int(0) %}
+          {% set heap = state_attr('sensor.led_matrix', 'heap') | int(0) %}
+          ### {{ 'Clock' if st == 'clock' else ('Paused' if is_state_attr('sensor.led_matrix', 'paused', true) else ('Playing' if st in ['gif', 'jpeg'] else 'Idle')) }}
+          `{{ file }}` · {{ fps }} fps · heap {{ heap }} B
+
+      - type: grid
+        columns: 4
+        square: false
+        cards:
+          - type: button
+            name: Prev
+            icon: mdi:skip-previous
+            tap_action:
+              action: perform-action
+              perform_action: script.led_matrix_previous
+          - type: button
+            name: Pause
+            icon: mdi:play-pause
+            tap_action:
+              action: perform-action
+              perform_action: script.led_matrix_pause_toggle
+          - type: button
+            name: Next
+            icon: mdi:skip-next
+            tap_action:
+              action: perform-action
+              perform_action: script.led_matrix_next
+          - type: button
+            name: Stop
+            icon: mdi:stop
+            tap_action:
+              action: perform-action
+              perform_action: script.led_matrix_stop
+
+      - type: entities
+        title: Panel
+        entities:
+          - switch.led_matrix_clock
+          - switch.led_matrix_auto_rotate
+          - switch.led_matrix_shuffle
+          - select.led_matrix_rotation
+          - number.led_matrix_brightness
+          - number.led_matrix_power_limit
+          - sensor.led_matrix
+
+      - type: vertical-stack
+        cards:
+          - type: entities
+            title: Play a stored file
+            entities:
+              - input_text.led_matrix_file
+          - type: button
+            name: Play this file
+            icon: mdi:play-circle-outline
+            tap_action:
+              action: perform-action
+              perform_action: script.led_matrix_play_typed
+
+      - type: markdown
+        content: |
+          Upload, delete or crop files on the board's own page:
+          [open the web UI](http://192.168.0.113/)

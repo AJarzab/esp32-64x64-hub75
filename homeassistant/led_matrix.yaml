@@ -1,0 +1,325 @@
+# ---------------------------------------------------------------------------
+#  ESP32 64x64 LED matrix (firmware v3.4) — Home Assistant package
+#
+#  Put this file in /config/packages/led_matrix.yaml and make sure
+#  configuration.yaml contains:
+#
+#      homeassistant:
+#        packages: !include_dir_named packages
+#
+#  Then restart Home Assistant. Everything below is created automatically:
+#  helpers, the REST sensor, the commands, the scripts and the entities.
+#
+#  Change the host once in Settings -> Devices & services -> Helpers ->
+#  "LED matrix host" (or edit the `initial:` value below). If the board has a
+#  PIN, put it in "LED matrix PIN" — every request carries it as ?pin=...
+# ---------------------------------------------------------------------------
+
+input_text:
+  led_matrix_host:
+    name: LED matrix host
+    initial: "192.168.0.113"
+    max: 64
+    icon: mdi:ip-network
+
+  led_matrix_pin:
+    name: LED matrix PIN
+    initial: ""
+    max: 16
+    mode: password
+    icon: mdi:lock-outline
+
+  led_matrix_file:
+    name: LED matrix file to play
+    initial: ""
+    max: 48
+    icon: mdi:file-image-outline
+
+# --- one generic GET command; every script builds the path ---------------
+rest_command:
+  led_matrix_get:
+    url: >-
+      http://{{ states('input_text.led_matrix_host') | trim }}/{{ path }}{{ '&' if '?' in path else '?' }}pin={{ states('input_text.led_matrix_pin') | trim }}
+    method: GET
+    timeout: 8
+
+# --- live state, polled every 30 s ---------------------------------------
+rest:
+  - resource_template: >-
+      http://{{ states('input_text.led_matrix_host') | trim }}/status?pin={{ states('input_text.led_matrix_pin') | trim }}
+    scan_interval: 30
+    timeout: 10
+    sensor:
+      - name: "LED matrix"
+        unique_id: led_matrix_status
+        icon: mdi:led-strip-variant
+        value_template: "{{ value_json.file | default('', true) }}"
+        json_attributes:
+          - type
+          - file
+          - paused
+          - auto
+          - shuffle
+          - rotate
+          - fps
+          - heap
+          - brightness
+          - rot
+          - asleep
+          - pwr
+          - fade
+          - sched
+          - uptime
+          - rssi
+
+# --- actions -------------------------------------------------------------
+script:
+  led_matrix_next:
+    alias: "LED matrix: next image"
+    icon: mdi:skip-next
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=next"
+
+  led_matrix_previous:
+    alias: "LED matrix: previous image"
+    icon: mdi:skip-previous
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=prev"
+
+  led_matrix_pause_toggle:
+    alias: "LED matrix: pause or resume"
+    icon: mdi:play-pause
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=toggle"
+
+  led_matrix_stop:
+    alias: "LED matrix: stop and clear"
+    icon: mdi:stop
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "stop"
+
+  led_matrix_play:
+    alias: "LED matrix: play file"
+    icon: mdi:play
+    fields:
+      file:
+        description: File name as shown in the web UI (e.g. logo_64.gif)
+        required: true
+        example: "logo_64.gif"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "play?f={{ file | urlencode }}"
+
+  led_matrix_play_typed:
+    alias: "LED matrix: play the file typed in the helper"
+    icon: mdi:play-circle-outline
+    sequence:
+      - action: script.led_matrix_play
+        data:
+          file: "{{ states('input_text.led_matrix_file') | trim }}"
+
+  led_matrix_brightness:
+    alias: "LED matrix: set brightness"
+    icon: mdi:brightness-6
+    fields:
+      value:
+        description: 1-255
+        required: true
+        example: "120"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "bright?v={{ value | int(90) }}"
+
+  led_matrix_rotation:
+    alias: "LED matrix: set rotation"
+    icon: mdi:screen-rotation
+    fields:
+      rot:
+        description: 0, 1, 2 or 3 (= 0/90/180/270 degrees)
+        required: true
+        example: "1"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "panel?rot={{ rot | int(0) }}"
+
+  led_matrix_power_limit:
+    alias: "LED matrix: set power limit"
+    icon: mdi:flash
+    fields:
+      value:
+        description: 20-100 percent
+        required: true
+        example: "80"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "panel?pwr={{ value | int(100) }}"
+
+  led_matrix_clock_on:
+    alias: "LED matrix: show clock"
+    icon: mdi:clock-outline
+    fields:
+      face:
+        description: 0 = digital, 1 = analog
+        default: 0
+      date:
+        description: 1 = show the date under the time
+        default: 1
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "clock?face={{ face | int(0) }}&date={{ date | int(1) }}"
+
+  led_matrix_clock_off:
+    alias: "LED matrix: hide clock, resume images"
+    icon: mdi:clock-remove-outline
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "clock?off=1"
+
+  led_matrix_auto_rotate:
+    alias: "LED matrix: auto-rotate playlist"
+    icon: mdi:rotate-3d-variant
+    fields:
+      on:
+        description: 1 = advance through the playlist, 0 = stay on one file
+        required: true
+        example: "1"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=auto&v={{ on | int(0) }}"
+
+  led_matrix_shuffle:
+    alias: "LED matrix: shuffle playlist"
+    icon: mdi:shuffle-variant
+    fields:
+      on:
+        description: 1 = shuffle, 0 = playlist order
+        required: true
+        example: "0"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=shuffle&v={{ on | int(0) }}"
+
+  led_matrix_interval:
+    alias: "LED matrix: playlist hold time"
+    icon: mdi:timer-outline
+    fields:
+      seconds:
+        description: Seconds per file (5-3600)
+        required: true
+        example: "30"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "ctl?a=interval&v={{ seconds | int(30) }}"
+
+  led_matrix_schedule:
+    alias: "LED matrix: on/off window"
+    icon: mdi:calendar-clock
+    fields:
+      on:
+        description: 1 = enable the daily window, 0 = leave the panel always on
+        required: true
+        example: "1"
+      from:
+        description: Local start time, HH:MM
+        required: true
+        example: "08:00"
+      to:
+        description: Local stop time, HH:MM
+        required: true
+        example: "23:00"
+    sequence:
+      - action: rest_command.led_matrix_get
+        data:
+          path: "schedule?on={{ on | int(1) }}&from={{ from }}&to={{ to }}"
+
+# --- entities for the dashboard / Android app ----------------------------
+template:
+  - switch:
+      - name: "LED matrix clock"
+        unique_id: led_matrix_clock
+        icon: mdi:clock-outline
+        state: "{{ state_attr('sensor.led_matrix', 'type') == 'clock' }}"
+        turn_on:
+          - action: script.led_matrix_clock_on
+        turn_off:
+          - action: script.led_matrix_clock_off
+
+      - name: "LED matrix auto-rotate"
+        unique_id: led_matrix_auto
+        icon: mdi:rotate-3d-variant
+        state: "{{ state_attr('sensor.led_matrix', 'auto') | default(false, true) }}"
+        turn_on:
+          - action: script.led_matrix_auto_rotate
+            data:
+              on: 1
+        turn_off:
+          - action: script.led_matrix_auto_rotate
+            data:
+              on: 0
+
+      - name: "LED matrix shuffle"
+        unique_id: led_matrix_shuffle
+        icon: mdi:shuffle-variant
+        state: "{{ state_attr('sensor.led_matrix', 'shuffle') | default(false, true) }}"
+        turn_on:
+          - action: script.led_matrix_shuffle
+            data:
+              on: 1
+        turn_off:
+          - action: script.led_matrix_shuffle
+            data:
+              on: 0
+
+  - number:
+      - name: "LED matrix brightness"
+        unique_id: led_matrix_brightness
+        icon: mdi:brightness-6
+        min: 1
+        max: 255
+        step: 1
+        value_template: "{{ state_attr('sensor.led_matrix', 'brightness') | default(90, true) | int(90) }}"
+        set_value:
+          - action: script.led_matrix_brightness
+            data:
+              value: "{{ value | int }}"
+
+      - name: "LED matrix power limit"
+        unique_id: led_matrix_power_limit
+        icon: mdi:flash
+        min: 20
+        max: 100
+        step: 5
+        unit_of_measurement: "%"
+        value_template: "{{ state_attr('sensor.led_matrix', 'pwr') | default(100, true) | int(100) }}"
+        set_value:
+          - action: script.led_matrix_power_limit
+            data:
+              value: "{{ value | int }}"
+
+  - select:
+      - name: "LED matrix rotation"
+        unique_id: led_matrix_rotation
+        icon: mdi:screen-rotation
+        options: ["0", "1", "2", "3"]
+        state: "{{ state_attr('sensor.led_matrix', 'rot') | default(0, true) | int(0) | string }}"
+        select_option:
+          - action: script.led_matrix_rotation
+            data:
+              rot: "{{ option | int }}"
